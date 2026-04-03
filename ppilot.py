@@ -8,11 +8,13 @@ import argparse
 import json
 import socket
 from pymavlink import mavutil
+import mmap
 
 os.environ['GDK_BACKEND'] = 'x11'
 os.environ['GDK_DEBUG'] = '3'
 
 DEFAULT_WFB_PORT = 8103
+DEFAULT_RETR_PORT = 5000
 DEFAULT_VIDEO_PORT = 5600
 
 import gi
@@ -26,6 +28,145 @@ GlobalLock = threading.Lock()
 OSD_Data = {}
 do_exit = False
 TELEMETRY_PERIOD = 0.25
+
+SHM_NAME = "/channel_data"
+SHM_SIZE = 4096
+
+# Offsets within shared_buffer structure
+OFFSET_RECORDING = 0      # uint32_t recording
+OFFSET_CHANNELS = 4       # crsf_channels_t channels (22 bytes)
+OFFSET_FLAG = 26          # uint8_t flag (4 + 22 = 26)
+OFFSET_AUX = 27           # int aux
+OFFSET_NUM_CHANNELS = 31  # uint8_t num_channels
+OFFSET_BANDS = 32         # uint16_t bands
+
+# CRSF channel configuration
+NUM_CHANNELS = 16
+CHANNEL_VALUE_MIN = 172
+CHANNEL_VALUE_MAX = 1811
+CHANNEL_VALUE_MID = 992   # Threshold for switch detection
+
+ARM_CHANNEL_INDEX = 4
+
+ACTUAL_DATA_LIFETIME_IN_SECONDS = 10
+
+class SharedMemoryReader:
+    """Simple shared memory reader - only opens memory and reads raw bytes."""
+
+    def __init__(self, shm_name: str = SHM_NAME, shm_size: int = SHM_SIZE):
+        self.shm_name = shm_name
+        self.shm_size = shm_size
+        self.shm_fd = None
+        self.mmap = None
+
+    def open(self) -> bool:
+        """Open the shared memory segment."""
+        try:
+            shm_path = self.shm_name
+            if not shm_path.startswith('/'):
+                shm_path = '/' + shm_path
+
+            self.shm_fd = os.open(f"/dev/shm{shm_path}", os.O_RDWR | os.O_CREAT)
+            self.mmap = mmap.mmap(self.shm_fd, self.shm_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
+            print(f"Opened shared memory: {shm_path} ({self.shm_size} bytes)")
+            return True
+        except PermissionError:
+            print(f"Error: Permission denied accessing shared memory.")
+            print("Try running with sudo.")
+            return False
+        except Exception as e:
+            print(f"Error opening shared memory: {e}")
+            return False
+
+    def close(self):
+        """Close the shared memory segment."""
+        if self.mmap:
+            self.mmap.close()
+            self.mmap = None
+        if self.shm_fd is not None:
+            os.close(self.shm_fd)
+            self.shm_fd = None
+
+    def is_flag_set(self) -> bool:
+        """Read the flag byte from shared memory."""
+        if not self.mmap:
+            return False
+        return self.mmap[OFFSET_FLAG] == 1
+
+    def reset_flag(self):
+        """Assign zero value to the flag byte from shared memory."""
+        if not self.mmap:
+            return
+        self.mmap[OFFSET_FLAG] = 0
+
+    def read_bytes(self, offset: int, size: int) -> bytes:
+        """Read raw bytes from shared memory at given offset."""
+        if not self.mmap:
+            return b''
+        return bytes(self.mmap[offset:offset + size])
+
+class CRSFBridge:
+    """CRSF protocol parser"""
+
+    def __init__(self):
+        self._channels: list[int] = []
+        self.shm_reader = SharedMemoryReader(SHM_NAME)
+        if not self.shm_reader.open():
+            print("Failed to open shared memory")
+        self.data_timestamp = 0
+
+    def update_data(self):
+        """Parse 22 bytes of packed CRSF channel data into 16 channel values."""
+
+        if not self.shm_reader.is_flag_set():
+            return
+
+        size_of_channels_data = OFFSET_FLAG - OFFSET_CHANNELS
+        data = self.shm_reader.read_bytes(OFFSET_CHANNELS, size_of_channels_data)
+        if len(data) < size_of_channels_data:
+            return
+
+        channels = []
+        # 16 channels * 11 bits = 176 bits = 22 bytes
+        # Parse bit-packed data
+        bit_offset = 0
+        for i in range(NUM_CHANNELS):
+            byte_offset = bit_offset // 8
+            bit_in_byte = bit_offset % 8
+
+            # Read up to 3 bytes to get 11 bits
+            val = 0
+            for j in range(3):
+                if byte_offset + j < len(data):
+                    val |= data[byte_offset + j] << (j * 8)
+
+            # Extract 11 bits
+            val = (val >> bit_in_byte) & 0x7FF
+            channels.append(val)
+            bit_offset += 11
+
+        self._channels = channels
+        self.data_timestamp = time.time()
+        self.shm_reader.reset_flag()
+
+    def has_new_data(self) -> bool:
+        return self.shm_reader.is_flag_set()
+
+    def get_data_timestamp(self) -> float:
+        return self.data_timestamp
+
+    def get_channel_value(self, channel_index: int) -> int | None:
+        """Get value of a specific channel by index (0-15)."""
+        if 0 <= channel_index < len(self._channels):
+            return self._channels[channel_index]
+        return None
+
+    def get_arm_state(self) -> bool | None:
+        """Check if arm switch is engaged based on arm channel value."""
+        arm_value = self.get_channel_value(ARM_CHANNEL_INDEX)
+        if arm_value is None:
+            return None
+        return arm_value > CHANNEL_VALUE_MID
 
 def mavlink_func(master):
     while not do_exit:
@@ -97,6 +238,7 @@ class X11Player:
         self.video_area.realize()
         self.video_area.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
         self.video_port = video_port
+        print(f"Video port: {self.video_port}")
 
         pipeline_str = (
             f"udpsrc port={self.video_port} buffer-size=90000 name=source ! "
@@ -114,6 +256,7 @@ class X11Player:
         self.sink = self.pipeline.get_by_name("sink")
         self.last_bytes = 0
         self.last_time = time.time()
+        self.bus = self.pipeline.get_bus()
         gdk_window = self.video_area.get_window()
         if hasattr(gdk_window, 'get_xid'):
             xid = gdk_window.get_xid()
@@ -121,14 +264,15 @@ class X11Player:
         else:
             print("Error: Window has no XID even in X11 mode!")
             sys.exit(1)
-
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_message)
         overlay = self.pipeline.get_by_name("overlay")
         overlay.connect("draw", self.on_draw)
         self.last_bytes = 0
         self.current_bitrate = 0
         self.bytes_per_sec = 0
         self.last_bitrate_check = time.time()
-        self.recording_bin = None
+        self.is_recording = None
         self.record_pad = None
         self.last_video_pts = 0
         self.subtitle_file = None
@@ -141,6 +285,10 @@ class X11Player:
         tee_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._timestamp_probe)
         if self.counter:
             self.counter.set_property("signal-handoffs", True)
+
+        self.crsf_bridge = CRSFBridge()
+        self.last_arm_state = False
+        self.is_auto_record = False
 
     def make_element(self, plugin, name):
         element = Gst.ElementFactory.make(plugin, name)
@@ -160,22 +308,24 @@ class X11Player:
             Gtk.main_quit()
 
     def toggle_record(self):
-        if self.recording_bin != None:
+        if self.is_recording != None:
             self.stop_recording()
         else:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"recording_{timestamp}"
-            srt_filename = filename + ".srt"
-            filename += ".mkv"
-            self.subtitle_file = open(srt_filename, "w", encoding="utf-8")
-            self.rec_start_time = self.last_video_pts
-            self.srt_counter = 1
-            self.rec_last_time = 0
-            self.start_recording(filename)
+            self.start_recording()
 
-    def start_recording(self, filename):
-        if self.recording_bin:
+    def start_recording(self):
+        if self.is_recording:
             return
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"recording_{timestamp}"
+        srt_filename = filename + ".srt"
+        filename += ".mkv"
+        self.subtitle_file = open(srt_filename, "w", encoding="utf-8")
+        self.rec_start_time = self.last_video_pts
+        self.srt_counter = 1
+        self.rec_last_time = 0
+
         self.rec_q = self.make_element("queue", "record_queue")
         self.rec_parse = self.make_element("h265parse", "record_parse")
         self.rec_mux = self.make_element("matroskamux", "record_mux")
@@ -185,25 +335,30 @@ class X11Player:
         self.rec_sink.set_property("sync", False)
         self.rec_parse.set_property("config-interval", -1)
 
-        elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
-        for el in elements:
+        self.rec_elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
+        for el in self.rec_elements:
             self.pipeline.add(el)
 
         self.rec_q.link(self.rec_parse)
         self.rec_parse.link(self.rec_mux)
         self.rec_mux.link(self.rec_sink)
 
-        for el in elements:
+        for el in self.rec_elements:
             el.sync_state_with_parent()
 
         template = self.tee.get_pad_template("src_%u")
         self.record_pad = self.tee.request_pad(template, None, None)
 
         sink_pad = self.rec_q.get_static_pad("sink")
+        clock = self.pipeline.get_clock()
+        base_time = self.pipeline.get_base_time()
+        running_time = clock.get_time() - base_time - 0.1
+        sink_pad.set_offset(-running_time)
+        print(f"Офсет встановлено: -{running_time / 1e9} сек")
         res = self.record_pad.link(sink_pad)
 
         if res == Gst.PadLinkReturn.OK:
-            self.recording_bin = True
+            self.is_recording = True
             print(f"Recording: {filename}")
         else:
             print(f"Link error: {res}")
@@ -222,30 +377,55 @@ class X11Player:
         return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
-        if not self.recording_bin:
+        if not self.is_recording:
             return
         self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
+        self.is_auto_record = False
 
     def _on_pad_idle(self, pad, info):
-        sink_pad = self.rec_q.get_static_pad("sink")
-        pad.unlink(sink_pad)
+        queue_pad = self.rec_q.get_static_pad("sink")
+        pad.unlink(queue_pad)
         self.tee.release_request_pad(pad)
 
-        sink_pad.send_event(Gst.Event.new_eos())
+        queue_pad.send_event(Gst.Event.new_eos())
+        sink_pad = self.pipeline.get_by_name("record_sink").get_static_pad("sink")
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_pad_event)
 
-        GLib.timeout_add(200, self._finalize_recording)
-
-        self.record_pad = None
         return Gst.PadProbeReturn.REMOVE
 
+    def on_pad_event(self, pad, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.EOS:
+            print("EOS went through filesink!")
+
+            GLib.idle_add(self._finalize_recording)
+
+            # Return DROP to stop EOS from proceeding (if necessary),
+            # or PASS to proceed as normal.
+            return Gst.PadProbeReturn.PASS
+
+        return Gst.PadProbeReturn.OK
+
+    def on_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("Received EOS! File is now finalized.")
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error: {err}")
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.pipeline:
+                old, new, pending = message.parse_state_changed()
+#                print(f"State changed from {old.value_nick} to {new.value_nick}")
+
     def _finalize_recording(self):
-        for el_name in ["record_queue", "record_parse", "record_mux", "record_sink"]:
-            el = self.pipeline.get_by_name(el_name)
+        for el in self.rec_elements:
             if el:
                 el.set_state(Gst.State.NULL)
                 self.pipeline.remove(el)
 
-        self.recording_bin = None
+        self.rec_elements = None
+        self.is_recording = None
         self.rec_start_time = 0
         if self.subtitle_file:
             self.subtitle_file.close()
@@ -254,6 +434,20 @@ class X11Player:
         return False
 
     def on_draw(self, overlay, context, timestamp, duration):
+
+        if self.crsf_bridge.has_new_data():
+            self.crsf_bridge.update_data()
+            current_arm_state = self.crsf_bridge.get_arm_state()
+            if current_arm_state is True and self.last_arm_state is False:
+                self.start_recording()
+                self.is_auto_record = True
+            self.last_arm_state = current_arm_state
+        else:
+            if self.is_recording and self.is_auto_record:
+                last_data_time = self.crsf_bridge.get_data_timestamp()
+                if time.time() - last_data_time > ACTUAL_DATA_LIFETIME_IN_SECONDS:
+                    self.stop_recording()
+
         pad = overlay.get_static_pad("sink")
         caps = pad.get_current_caps()
         if not caps:
@@ -290,7 +484,7 @@ class X11Player:
 
             context.select_font_face("Courier New", 0, 1)
             context.set_font_size(20)
-            if self.recording_bin != None:
+            if self.is_recording != None:
                 context.set_source_rgb(0.9, 0.1, 0.1)
                 context.move_to(x + 15, y + 30)
                 context.show_text(f"● REC")
@@ -378,7 +572,7 @@ if __name__ == "__main__":
                 'wifi_chan': 0, 'wifi_freq': 0}
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((args.address, args.wfb_port))
-        print("Підключено до сервера JSON")
+        print("Connected to JSON server")
 
         buffer = ""
         finish = 0
